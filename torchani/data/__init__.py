@@ -119,7 +119,9 @@ PADDING = {
     'species': -1,
     'coordinates': 0.0,
     'forces': 0.0,
-    'energies': 0.0
+    'energies': 0.0,
+    'pbc': False,
+    'cell':999.0
 }
 
 

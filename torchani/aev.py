@@ -7,8 +7,8 @@ import sys
 import warnings
 import importlib_metadata
 
-has_cuaev = 'torchani.cuaev' in importlib_metadata.metadata(__package__).get_all('Provides')
-
+#has_cuaev = 'torchani.cuaev' in importlib_metadata.metadata(__package__).get_all('Provides')
+has_cuaev = False
 if has_cuaev:
     # We need to import torchani.cuaev to tell PyTorch to initialize torch.ops.cuaev
     from . import cuaev  # type: ignore # noqa: F401
@@ -108,6 +108,11 @@ def compute_shifts(cell: Tensor, pbc: Tensor, cutoff: float) -> Tensor:
         :class:`torch.Tensor`: long tensor of shifts. the center cell and
             symmetric cells are not included.
     """
+    # CAGRI: cell is now [N,3,3], use the min. cell to calculate num. shifts
+    # CAGRI: pbc is still [3,]
+    if cell.dim() == 3:
+        min_cell = cell.min(dim=0)[0] # CAGRI
+        cell = min_cell # CAGRI
     reciprocal_cell = cell.inverse().t()
     inv_distances = reciprocal_cell.norm(2, -1)
     num_repeats = torch.ceil(cutoff * inv_distances).to(torch.long)
@@ -116,6 +121,7 @@ def compute_shifts(cell: Tensor, pbc: Tensor, cutoff: float) -> Tensor:
     r2 = torch.arange(1, num_repeats[1].item() + 1, device=cell.device)
     r3 = torch.arange(1, num_repeats[2].item() + 1, device=cell.device)
     o = torch.zeros(1, dtype=torch.long, device=cell.device)
+
     return torch.cat([
         torch.cartesian_prod(r1, r2, r3),
         torch.cartesian_prod(r1, r2, o),
@@ -134,7 +140,7 @@ def compute_shifts(cell: Tensor, pbc: Tensor, cutoff: float) -> Tensor:
 
 
 def neighbor_pairs(padding_mask: Tensor, coordinates: Tensor, cell: Tensor,
-                   shifts: Tensor, cutoff: float) -> Tuple[Tensor, Tensor]:
+                   shifts: Tensor, cutoff: float):
     """Compute pairs of atoms that are neighbors
 
     Arguments:
@@ -152,12 +158,10 @@ def neighbor_pairs(padding_mask: Tensor, coordinates: Tensor, cell: Tensor,
     num_atoms = padding_mask.shape[1]
     num_mols = padding_mask.shape[0]
     all_atoms = torch.arange(num_atoms, device=cell.device)
-
     # Step 2: center cell
     # torch.triu_indices is faster than combinations
     p12_center = torch.triu_indices(num_atoms, num_atoms, 1, device=cell.device)
     shifts_center = shifts.new_zeros((p12_center.shape[1], 3))
-
     # Step 3: cells with shifts
     # shape convention (shift index, molecule index, atom index, 3)
     num_shifts = shifts.shape[0]
@@ -170,17 +174,32 @@ def neighbor_pairs(padding_mask: Tensor, coordinates: Tensor, cell: Tensor,
     # Step 4: combine results for all cells
     shifts_all = torch.cat([shifts_center, shifts_outside])
     p12_all = torch.cat([p12_center, p12], dim=1)
-    shift_values = shifts_all.to(cell.dtype) @ cell
+    # CAGRI: now cell is NX3X3
+    if cell.dim() == 3:
+        shift_values = cell @ (shifts_all.to(cell.dtype).t())
+        shift_values = torch.transpose(shift_values, 1, 2)
+    else:
+        shift_values = shifts_all.to(cell.dtype) @ cell.view(3,3)
 
-    # step 5, compute distances, and find all pairs within cutoff
     selected_coordinates = coordinates.index_select(1, p12_all.view(-1)).view(num_mols, 2, -1, 3)
-    distances = (selected_coordinates[:, 0, ...] - selected_coordinates[:, 1, ...] + shift_values).norm(2, -1)
-    in_cutoff = (distances <= cutoff).nonzero()
-    molecule_index, pair_index = in_cutoff.unbind(1)
-    molecule_index *= num_atoms
+
+    vecs = selected_coordinates[:, 0, ...] - selected_coordinates[:, 1, ...] + shift_values
+    distances = (vecs).norm(2, -1)
+    in_cutoff = ((distances <= cutoff) & (distances > 0.0)).nonzero()
+
+    molecule_index_orig, pair_index = in_cutoff.unbind(1)
+
     atom_index12 = p12_all[:, pair_index]
     shifts = shifts_all.index_select(0, pair_index)
-    return molecule_index + atom_index12, shifts
+    new_atom_index12 = molecule_index_orig * num_atoms + atom_index12
+    if cell.dim() == 3:
+        selected_cells = cell.index_select(0, molecule_index_orig)
+        sub_shift_values = torch.bmm(selected_cells, shifts.to(cell.dtype).unsqueeze(2))
+        sub_shift_values = torch.transpose(sub_shift_values, 1, 2).reshape(-1,3)
+    else:
+        sub_shift_values = shifts.to(cell.dtype) @ cell.view(3,3)
+
+    return new_atom_index12, sub_shift_values
 
 
 def neighbor_pairs_nopbc(padding_mask: Tensor, coordinates: Tensor, cutoff: float) -> Tensor:
@@ -285,8 +304,8 @@ def compute_aev(species: Tensor, coordinates: Tensor, triu_index: Tensor,
         vec = selected_coordinates[0] - selected_coordinates[1]
     else:
         cell, shifts = cell_shifts
-        atom_index12, shifts = neighbor_pairs(species == -1, coordinates_, cell, shifts, Rcr)
-        shift_values = shifts.to(cell.dtype) @ cell
+        atom_index12, shift_values = neighbor_pairs(species == -1, coordinates_, cell, shifts, Rcr)
+
         selected_coordinates = coordinates.index_select(0, atom_index12.view(-1)).view(2, -1, 3)
         vec = selected_coordinates[0] - selected_coordinates[1] + shift_values
 
@@ -410,6 +429,7 @@ class AEVComputer(torch.nn.Module):
         # These values are used when cell and pbc switch are not given.
         cutoff = max(self.Rcr, self.Rca)
         default_cell = torch.eye(3, dtype=self.EtaR.dtype, device=self.EtaR.device)
+        default_cell = default_cell.unsqueeze(0)
         default_pbc = torch.zeros(3, dtype=torch.bool, device=self.EtaR.device)
         default_shifts = compute_shifts(default_cell, default_pbc, cutoff)
         self.register_buffer('default_cell', default_cell)
