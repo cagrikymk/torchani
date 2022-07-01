@@ -429,7 +429,6 @@ class AEVComputer(torch.nn.Module):
         # These values are used when cell and pbc switch are not given.
         cutoff = max(self.Rcr, self.Rca)
         default_cell = torch.eye(3, dtype=self.EtaR.dtype, device=self.EtaR.device)
-        default_cell = default_cell.unsqueeze(0)
         default_pbc = torch.zeros(3, dtype=torch.bool, device=self.EtaR.device)
         default_shifts = compute_shifts(default_cell, default_pbc, cutoff)
         self.register_buffer('default_cell', default_cell)
